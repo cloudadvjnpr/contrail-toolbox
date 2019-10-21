@@ -1,0 +1,488 @@
+#!/usr/bin/python
+
+import os
+import sys
+import argparse
+import time
+import uuid
+import subprocess
+import socket
+import json
+import yaml
+import requests
+import pprint
+from vnc_api import vnc_api
+from vnc_api.gen import resource_client
+from vnc_api.gen import resource_xsd
+from cfgm_common import _obj_serializer_all
+
+default_args_k3 = [
+    ('auth-username', 'admin'),
+    ('auth-password', 'contrail123'),
+    ('auth-tenant', 'admin'),
+    ('auth-domain', 'default'),
+    ('auth-region', 'RegionOne'),
+    ('auth-server', '10.6.8.2'),
+    ('auth-url', '/v3/auth/tokens'),
+    ('api-server', '10.6.11.1'),
+    ('domain', 'default-domain'),
+    ('tenant', 'admin')]
+
+default_args_k2 = [
+    ('auth-username', 'admin'),
+    ('auth-password', 'contrail123'),
+    ('auth-tenant', 'admin'),
+    ('auth-domain', 'default-domain'),
+    ('auth-region', 'RegionOne'),
+    ('auth-server', '10.6.8.2'),
+    ('auth-url', '/v2.0/tokens'),
+    ('api-server', '10.6.11.1'),
+    ('domain', 'default-domain'),
+    ('tenant', 'admin')]
+
+default_args = default_args_k3
+
+
+def fqn_to_str(fqn):
+    str = ''
+    for name in fqn:
+        str += name + ':'
+    return str.rstrip(':')
+
+def str_to_fqn(str):
+    fqn = str.split(':')
+    if '' in fqn:
+        fqn.remove('')
+    return fqn
+
+
+class ConfigConnect():
+    def __init__(self, args):
+        self.controller = args.api_server
+        self.vnc = vnc_api.VncApi(username = args.auth_username,
+                password = args.auth_password, tenant_name = args.auth_tenant,
+                domain_name = args.auth_domain,
+                api_server_host = args.api_server,
+                auth_host = args.auth_server, auth_url = args.auth_url)
+        try:
+            self.tenant = self.vnc.project_read(
+                    fq_name = [args.domain, args.tenant])
+        except:
+            self.tenant = None
+
+
+class ConfigResource():
+    def __init__(self, connect, res_dict):
+        self.vnc = connect.vnc
+        self.tenant = connect.tenant
+        self.res_dict = res_dict
+
+    def obj_to_json(self, obj):
+        return json.dumps(obj, default = _obj_serializer_all,
+                indent=4, separators=(',', ': '))
+
+    def obj_to_dict(self, obj):
+        return json.loads(self.obj_to_json(obj))
+
+    def list_resource_type(self):
+        for key in self.res_dict.keys():
+            print key
+
+    def list_resource(self, type):
+        func_name = self.res_dict[type].object_type + 's_list'
+        func = getattr(self.vnc, func_name)
+        list = func()[type + 's']
+        for res in list:
+            print fqn_to_str(res['fq_name'])
+
+    def show_resource(self, args):
+        if ':' in args.res_name:
+            fq_name = str_to_fqn(args.res_name)
+        else:
+            fq_name = self.tenant.fq_name + [args.res_name]
+        cls = self.res_dict[args.res_type]
+        func_name = cls.object_type + '_read'
+        func = getattr(self.vnc, func_name)
+        try:
+            res = func(fq_name = fq_name)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        if (args.format == 'yaml'):
+            dict = [{
+                'resource_type': res._type,
+                'parent_type': res.parent_type,
+                'resource_fq_name': res.fq_name,
+                'resource': self.obj_to_dict(res)}]
+            print yaml.safe_dump(dict, default_flow_style=False)
+        elif (args.format == 'dump'):
+            res.dump()
+        else:
+            print self.obj_to_json(res)
+
+    def resource_template_type(self, type_name):
+        td = {}
+        xsd_type = getattr(resource_xsd, type_name)
+        for name in xsd_type.attr_fields:
+            attr = xsd_type.attr_field_type_vals[name]
+            if attr['is_complex']:
+                if attr['is_array']:
+                    td[name] = [self.resource_template_type(attr['simple_type'])]
+                else:
+                    td[name] = self.resource_template_type(attr['simple_type'])
+            else:
+                if attr['restrictions']:
+                    td[name] = attr['attr_type'] + str(attr['restrictions'])
+                else:
+                    td[name] = attr['attr_type']
+        return td
+
+    def resource_template(self, type):
+        td = {}
+        cls = self.res_dict[type]
+        for name in cls.prop_fields:
+            prop = cls.prop_field_types[name]
+            if prop['is_complex']:
+                td[name] = self.resource_template_type(prop['xsd_type'])
+            else:
+                if prop['restrictions']:
+                    td[name] = prop['xsd_type'] + str(prop['restrictions'])
+                else:
+                    td[name] = prop['xsd_type']
+        for name in cls.ref_fields:
+            ref = cls.ref_field_types[name]
+            if ref[1] == 'None':
+                attr = None
+            else:
+                attr = self.resource_template_type(ref[1])
+            td[name] = [{'to': 'fq_name', 'uuid': 'UUID', 'attr': attr}]
+        template = [{
+                'resource_type': type,
+                'parent_type': 'string' + str(cls.parent_types),
+                'resource_fq_name': [],
+                'resource': td}]
+        #print json.dumps(td, indent=4, separators=(',', ': '))
+        print yaml.safe_dump(template, default_flow_style=False)
+
+    def set_resource_type(self, type_name, res):
+        xsd_type = getattr(resource_xsd, type_name)
+        #print "--------"
+        #print "type: %s, xsd_type: %s" %(type_name, xsd_type)
+        #print "res: %s" %(res)
+        type = xsd_type()
+        for name in res.keys():
+            if name not in xsd_type.attr_fields:
+                print 'ERROR: Key %s is invalid!' %(name)
+                continue
+            attr = xsd_type.attr_field_type_vals[name]
+            if attr['is_complex'] and res[name]:
+                if attr['is_array']:
+                    val = []
+                    for item in res[name]:
+                        val.append(self.set_resource_type(attr['simple_type'], item))
+                else:
+                    val = self.set_resource_type(attr['simple_type'], res[name])
+            else:
+                val = res[name]
+            func_name = 'set_' + name
+            func = getattr(type, func_name)
+            func(val)
+        return type
+
+    def set_resource_ref(self, res, attr_type):
+        to_list = []
+        attr_list = []
+        #print "--------"
+        #print "res: %s, attr_type: %s" %(res, attr_type)
+        for ref in res:
+            if attr_type == 'None':
+                to_list.append(ref)
+            else:
+                to_list.append(ref['to'])
+                if ref.has_key('attr') and ref['attr']:
+                    for name in ref['attr'].keys():
+                        attr = self.set_resource_type(attr_type, ref['attr'])
+                        attr_list.append(attr)
+        return to_list, attr_list
+
+    def set_resource(self, item):
+        type = item['resource_type']
+        parent_type = item['parent_type']
+        res_fqn = item['resource_fq_name']
+        res = item['resource']
+        cls = self.res_dict[type]
+        func_name = cls.object_type + '_read'
+        func = getattr(self.vnc, func_name)
+        try:
+            obj = func(fq_name = res_fqn)
+            update = True
+        except:
+            obj = cls(parent_type = parent_type, fq_name = res_fqn)
+            update = False
+        for name in res.keys():
+            if name in cls.prop_fields:
+                prop = cls.prop_field_types[name]
+                if prop['is_complex']:
+                    val = self.set_resource_type(prop['xsd_type'], res[name])
+                else:
+                    val = res[name]
+                func_name = 'set_' + name
+                func = getattr(obj, func_name)
+                func(val)
+            elif name in cls.ref_fields:
+                attr_type = cls.ref_field_types[name][1]
+                to_list, attr_list = self.set_resource_ref(res[name], attr_type)
+                func_name = 'set_' + name
+                func_name = func_name.replace('refs', 'list')
+                func = getattr(obj, func_name)
+                if attr_type == 'None':
+                    func(to_list)
+                else:
+                    func(to_list, attr_list)
+        #print self.obj_to_json(obj)
+        if update:
+            func_name = cls.object_type + '_update'
+        else:
+            func_name = cls.object_type + '_create'
+        func = getattr(self.vnc, func_name)
+        try:
+            func(obj)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+
+    def del_resource_force(self, obj_id, obj_type):
+        type_int = ['routing_instance']
+        func_read = getattr(self.vnc, obj_type + '_read')
+        obj = func_read(id = obj_id)
+        print '%s: %s' %(obj_type, obj.fq_name)
+        for types in obj.children_fields:
+            type = types.rstrip('s')
+            #print '  Child type: %s' %type
+            if type in type_int:
+                continue
+            f_get = getattr(obj, 'get_' + types)
+            list = f_get()
+            if list:
+                for ref in list:
+                    self.del_resource_force(ref['uuid'], type)
+
+        for types in obj.backref_fields:
+            type = types.replace('_back_refs', '')
+            #print '  BackRef type: %s' %type
+            if type in type_int:
+                continue
+            f_get = getattr(obj, 'get_' + types)
+            list = f_get()
+            if list:
+                for ref in list:
+                    self.del_resource_force(ref['uuid'], type)
+        print 'Delete obj %s' %obj.fq_name
+        func_del = getattr(self.vnc, obj_type + '_delete')
+        func_del(id = obj.uuid)
+
+    def del_resource(self, args):
+        id = None
+        if (len(args.res_name) == 36) and (args.res_name.count('-') == 4):
+            id = args.res_name
+        elif ':' in args.res_name:
+            fq_name = str_to_fqn(args.res_name)
+        else:
+            fq_name = self.tenant.fq_name + [args.res_name]
+        if args.force:
+            if not id:
+                id = self.vnc.fq_name_to_id(args.res_type, fq_name)
+            obj_type = args.res_type.replace('-', '_')
+            self.del_resource_force(id, obj_type)
+            return
+        func_name = self.res_dict[args.res_type].object_type + '_delete'
+        func = getattr(self.vnc, func_name)
+        try:
+            if id:
+                res = func(id = id)
+            else:
+                res = func(fq_name = fq_name)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+
+
+class ConfigOp():
+    def __init__(self, connect, res_dict):
+        self.vnc = connect.vnc
+        self.controller = connect.controller
+        self.res_dict = res_dict
+
+    def show(self, res, args):
+        if not args.res_type:
+            res.list_resource_type()
+        elif args.res_type not in self.res_dict.keys():
+            print 'ERROR: Resource type %s is invalid!' %(args.res_type)
+        elif args.template:
+            res.resource_template(args.res_type)
+        elif args.res_name:
+            res.show_resource(args)
+        else:
+            res.list_resource(args.res_type)
+
+    def set(self, res, args):
+        with open(args.file, 'r') as fd:
+            try:
+                res_list = yaml.safe_load(fd)
+            except Exception as e:
+                print 'ERROR: %s' %(str(e))
+                return
+        for item in res_list:
+            if (item['resource_type'] == 'job'):
+                self.run_job(item)
+            elif (item['resource_type'] == 'reference'):
+                self.update_ref(item)
+            else:
+                res.set_resource(item)
+
+    def delete(self, res, args):
+        if not args.res_type:
+            res.list_resource_type()
+        elif args.res_type not in self.res_dict.keys():
+            print 'ERROR: Resource type %s is invalid!' %(args.res_type)
+        elif args.res_name:
+            res.del_resource(args)
+        else:
+            print 'ERROR: Resource name is missing!'
+
+    def check_job(self, res):
+        fabric_fqn = fqn_to_str(res['resource']['input']['fabric_fq_name'])
+        template_fqn = fqn_to_str(res['resource']['job_template_fq_name'])
+        url = 'http://%s:8081/analytics/uves/job-execution/%s:%s?flat' \
+                %(self.controller, fabric_fqn, template_fqn)
+        while (1):
+            time.sleep(2)
+            response = requests.get(url)
+            body = response.json()
+            status = body['FabricJobExecution']['job_status']
+            progress = body['FabricJobExecution']['percentage_completed']
+            if (type(status) is unicode):
+                print '%s, %s%%' %(status, progress)
+                if (progress == 100):
+                    break
+            else:
+                print "%s, %s%%" %(status[1][0], progress[1][0])
+
+    def run_job(self, res):
+        template_fq_name = res['resource']['job_template_fq_name']
+        job_input = res['resource']['input']
+        self.vnc.execute_job(job_template_fq_name = template_fq_name,
+                job_input = job_input)
+        self.check_job(res)
+
+    def update_ref(self, res):
+        src_id = self.vnc.fq_name_to_id(res['resource']['src_type'],
+                res['resource']['src_fqn'])
+        dst_id = self.vnc.fq_name_to_id(res['resource']['dst_type'],
+                res['resource']['dst_fqn'])
+        self.vnc.ref_update(operation = res['operation'],
+                obj_type = res['resource']['src_type'], obj_uuid = src_id,
+                ref_type = res['resource']['dst_type'], ref_uuid = dst_id,
+                attr = res['resource']['attr'], ref_fq_name = None)
+
+    def fqn_to_id(self, res, args):
+        print self.vnc.fq_name_to_id(args.res_type, str_to_fqn(args.fqn))
+
+    def id_to_fqn(self, res, args):
+        print fqn_to_str(self.vnc.id_to_fq_name(args.id))
+
+
+class ConfigCli():
+    def __init__(self):
+        pass
+
+    def env(self, *args, **kwargs):
+        for arg in args:
+            value = os.environ.get(arg, None)
+            if value:
+                return value
+        return kwargs.get('default', '')
+
+    def parser_init(self):
+        parser = argparse.ArgumentParser()
+        self.parser = parser
+        parser.add_argument('--auth-username', help = 'User name')
+        parser.add_argument('--auth-password', help = 'Password')
+        parser.add_argument('--auth-tenant', help = 'Auth tenant name')
+        parser.add_argument('--auth-domain', help = 'Auth domain name')
+        parser.add_argument('--auth-region', help = 'Region name')
+        parser.add_argument('--auth-server', help = 'Auth server address')
+        parser.add_argument('--auth-url', help = 'Auth URL')
+        parser.add_argument('--api-server', help = 'API server address')
+        parser.add_argument('--domain', help = 'Domain name')
+        parser.add_argument('--tenant', help = 'Tenant name')
+
+        op_parsers = parser.add_subparsers(metavar = '<operation>')
+
+        p = op_parsers.add_parser('show', help = 'Show')
+        p.set_defaults(op = 'show')
+        p.add_argument('res_type', nargs = '?', default = None,
+                metavar = '<type>', help = 'The resource type')
+        p.add_argument('res_name', nargs = '?', default = None,
+                metavar = '<name>', help = 'The resource name')
+        p.add_argument('--template', action = 'store_true',
+                help = 'Template')
+        p.add_argument('--format',
+                choices = ['brief', 'json', 'yaml', 'dump'],
+                default = 'json', metavar = '<format>',
+                help = 'The object format ' \
+                       '[ brief | json | yaml | dump ]')
+
+        p = op_parsers.add_parser('set', help = 'Set')
+        p.set_defaults(op = 'set')
+        p.add_argument('--file', help = 'File')
+
+        p = op_parsers.add_parser('delete', help = 'Delete')
+        p.set_defaults(op = 'delete')
+        p.add_argument('res_type', nargs = '?', default = None,
+                metavar = '<type>', help = 'The resource type')
+        p.add_argument('res_name', nargs = '?', default = None,
+                metavar = '<name>', help = 'The resource name')
+        p.add_argument('--force', action = 'store_true',
+                help = 'Force')
+
+        p = op_parsers.add_parser('get-id', help = 'Get UUID by FQN')
+        p.set_defaults(op = 'fqn_to_id')
+        p.add_argument('res_type', default = None,
+                metavar = '<type>', help = 'The resource type')
+        p.add_argument('fqn', default = None,
+                metavar = '<FQN>', help = 'The FQ name')
+
+        p = op_parsers.add_parser('get-fqn', help = 'Get FQN by UUID')
+        p.set_defaults(op = 'id_to_fqn')
+        p.add_argument('id', default = None,
+                metavar = '<UUID>', help = 'The UUID')
+
+    def get_res_dict(self):
+        list = dir(resource_client)
+        self.res_dict = {}
+        for name in list:
+            cls = getattr(resource_client, name)
+            if hasattr(cls, 'resource_type'):
+                self.res_dict[cls.resource_type] = cls
+
+    def start(self):
+        self.parser_init()
+        args = self.parser.parse_args()
+        self.get_res_dict()
+        connect = ConfigConnect(args)
+        res = ConfigResource(connect, self.res_dict)
+        op = ConfigOp(connect, self.res_dict)
+        getattr(op, args.op)(res, args)
+
+
+if __name__ == '__main__':
+    for arg in default_args:
+        if not ('--' + arg[0]) in sys.argv:
+            env_v = os.environ.get(arg[0].upper().replace('-', '_'))
+            if env_v:
+                arg_v = env_v
+            else:
+                arg_v = arg[1]
+            sys.argv.insert(1, ('--' + arg[0]))
+            sys.argv.insert(2, arg_v)
+    ConfigCli().start()
+
