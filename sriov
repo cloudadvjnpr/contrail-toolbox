@@ -1,0 +1,143 @@
+#!/usr/bin/python
+
+import os
+import sys
+import argparse
+import time
+import uuid
+import subprocess
+import socket
+import json
+import yaml
+import requests
+import pprint
+from vnc_api import vnc_api
+from vnc_api.gen import resource_client
+from vnc_api.gen import resource_xsd
+from cfgm_common import _obj_serializer_all
+
+sriov_physical_network = 'sriov'
+
+default_args = [
+    ('auth-username', 'admin'),
+    ('auth-password', 'contrail123'),
+    ('auth-tenant', 'admin'),
+    ('auth-domain', 'default'),
+    ('auth-region', 'RegionOne'),
+    ('auth-server', '127.0.0.1'),
+    ('auth-url', '/v3/auth/tokens'),
+    ('api-server', '127.0.0.1'),
+    ('domain', 'default-domain'),
+    ('tenant', 'admin')]
+
+
+class ConfigConnect():
+    def __init__(self, args):
+        self.controller = args.api_server
+        self.vnc = vnc_api.VncApi(username = args.auth_username,
+                password = args.auth_password, tenant_name = args.auth_tenant,
+                domain_name = args.auth_domain,
+                api_server_host = args.api_server,
+                auth_host = args.auth_server, auth_url = args.auth_url)
+        try:
+            self.tenant = self.vnc.project_read(
+                    fq_name = [args.domain, args.tenant])
+        except:
+            self.tenant = None
+
+class SriovCli():
+    def __init__(self):
+        self.vnc = None
+        self.tenant_fqn = None
+
+    def env(self, *args, **kwargs):
+        for arg in args:
+            value = os.environ.get(arg, None)
+            if value:
+                return value
+        return kwargs.get('default', '')
+
+    def openstack_cli(self, args):
+        env = '/var/lib/kolla/config_files/admin-openrc.sh'
+        cmd = 'docker exec kolla_toolbox bash -c "source %s; openstack %s"' \
+                %(env, args)
+        p = subprocess.Popen(cmd, stdout = subprocess.PIPE, shell = True)
+        output = p.stdout.read()
+        #print output
+
+    def update_network(self, name):
+        print 'Check virtual network %s...' %name
+        try:
+            obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant_fqn + [name])
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        pp = obj.get_provider_properties()
+        if pp and (pp.physical_network == sriov_physical_network) and \
+                (pp.segmentation_id == obj.virtual_network_network_id):
+            print 'Skip.'
+        else:
+            print 'Update virtual network %s...' %name
+            pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
+                    sriov_physical_network)
+            obj.set_provider_properties(pp)
+            self.vnc.virtual_network_update(obj)
+
+    def launch_vm(self, args):
+        print 'Launch SRIOV VM...'
+        if not args.network:
+            print 'ERROR: Argument "network" is missing!'
+            return
+        self.update_network(args.network)
+        #self.openstack_cli('network list')
+
+    def delete_vm(self, args):
+        print 'Delete SRIOV VM...'
+
+    def parser_init(self):
+        parser = argparse.ArgumentParser()
+        self.parser = parser
+        parser.add_argument('--auth-username', help = 'User name')
+        parser.add_argument('--auth-password', help = 'Password')
+        parser.add_argument('--auth-tenant', help = 'Auth tenant name')
+        parser.add_argument('--auth-domain', help = 'Auth domain name')
+        parser.add_argument('--auth-region', help = 'Region name')
+        parser.add_argument('--auth-server', help = 'Auth server address')
+        parser.add_argument('--auth-url', help = 'Auth URL')
+        parser.add_argument('--api-server', help = 'API server address')
+        parser.add_argument('--domain', help = 'Domain name')
+        parser.add_argument('--tenant', help = 'Tenant name')
+
+        parser.add_argument('cmd', help = 'Command')
+        parser.add_argument('name', help = 'Name')
+        parser.add_argument('--network', help = 'Virtual network')
+
+    def start(self):
+        self.parser_init()
+        args = self.parser.parse_args()
+        #print 'args: %s' %args
+        connect = ConfigConnect(args)
+        self.vnc = connect.vnc
+        self.tenant_fqn = connect.tenant.fq_name
+        cmd_map = {'launch-vm': self.launch_vm,
+                   'delete-vm': self.delete_vm}
+        func = cmd_map.get(args.cmd)
+        if func:
+            func(args)
+        else:
+            print 'ERROR: Command %s is invalid!' %args.cmd
+
+
+if __name__ == '__main__':
+    for arg in default_args:
+        if not ('--' + arg[0]) in sys.argv:
+            env_v = os.environ.get(arg[0].upper().replace('-', '_'))
+            if env_v:
+                arg_v = env_v
+            else:
+                arg_v = arg[1]
+            sys.argv.insert(1, ('--' + arg[0]))
+            sys.argv.insert(2, arg_v)
+    SriovCli().start()
+
