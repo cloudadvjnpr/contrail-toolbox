@@ -1,0 +1,22 @@
+#!/bin/bash
+
+source /etc/contrail/openstackrc_v3
+
+token=$(openstack token issue | awk "/ id /"'{print $4}')
+
+project_list=$(openstack project list -f value -c ID)
+
+get_project()
+{
+    uuid=${id:0:8}'-'${id:8:4}'-'${id:12:4}'-'${id:16:4}'-'${id:20}
+    echo $uuid
+    curl -s -H "X-Auth-Token: $token" \
+        http://10.87.68.151:8082/project/$uuid
+}
+
+for id in $project_list;
+do
+    get_project
+done
+
+

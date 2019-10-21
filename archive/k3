@@ -1,0 +1,152 @@
+#!/bin/bash
+
+auth_url=172.16.0.151:6000/v3
+username=admin
+password=contrail123
+tenant=admin
+
+get_token()
+{
+    token=$(curl -s -D - -H "Content-Type: application/json" -d "
+    {
+    \"auth\": {
+        \"identity\": {
+            \"methods\": [\"password\"],
+            \"password\": {
+                \"user\": {
+                    \"name\": \"$username\",
+                    \"domain\": {\"id\": \"default\"},
+                    \"password\": \"$password\"
+                }
+            }
+        }
+    }
+    }" http://$auth_url/auth/tokens | awk "/X-Subject-Token/"'{print $2}')
+    echo "$token"
+}
+
+get_token_domain()
+{
+    token=$(curl -s -D - -H "Content-Type: application/json" -d "
+    {
+    \"auth\": {
+        \"scope\": {
+            \"domain\": {\"id\": \"default\"}
+        },
+        \"identity\": {
+            \"methods\": [\"password\"],
+            \"password\": {
+                \"user\": {
+                    \"name\": \"$username\",
+                    \"domain\": {\"id\": \"default\"},
+                    \"password\": \"$password\"
+                }
+            }
+        }
+    }
+    }" http://$auth_url/auth/tokens | awk "/X-Subject-Token/"'{ print $2 }')
+    echo "$token"
+}
+
+get_token_project()
+{
+    token=$(curl -s -D - -H "Content-Type: application/json" -d "
+    {
+    \"auth\": {
+        \"scope\": {
+            \"project\": {
+                \"domain\": {\"id\": \"default\"},
+                \"name\": \"admin\"
+            }
+        },
+        \"identity\": {
+            \"methods\": [\"password\"],
+            \"password\": {
+                \"user\": {
+                    \"name\": \"$username\",
+                    \"domain\": {\"id\": \"default\"},
+                    \"password\": \"$password\"
+                }
+            }
+        }
+    }
+    }" http://$auth_url/auth/tokens | awk "/X-Subject-Token/"'{printf $2}')
+
+    token=${token:0:32}
+}
+
+list_project()
+{
+    curl -s -H "X-Auth-Token: $token" \
+        http://$auth_url/auth/projects | python -m json.tool
+}
+
+list_domain()
+{
+    curl -s -H "X-Auth-Token: $token" \
+        http://$auth_url/auth/domains | python -m json.tool
+}
+
+list_user()
+{
+    curl -s -H "X-Auth-Token: $token" \
+        http://$auth_url/users | python -m json.tool
+}
+
+list_role()
+{
+    curl -s -H "X-Auth-Token: $token" \
+        http://$auth_url/roles | python -m json.tool
+}
+
+help()
+{
+    echo "help"
+}
+
+test()
+{
+    echo test
+}
+
+main()
+{
+    case "$1" in
+        get-token)
+            get_token
+            ;;
+        get-token-domain)
+            get_token_domain
+            ;;
+        get-token-project)
+            get_token_project
+            ;;
+        list-project)
+            get_token_project
+            list_project
+            ;;
+        list-domain)
+            get_token_project
+            list_domain
+            ;;
+        list-user)
+            get_token_project
+            list_user
+            ;;
+        list-role)
+            get_token_project
+            list_role
+            ;;
+        test)
+            shift
+            test "$@"
+            ;;
+        *)
+            help
+            ;;
+    esac
+}
+
+main "$@"
+exit 0
+

@@ -1,0 +1,149 @@
+#!/usr/bin/python
+
+import os
+import sys
+import argparse
+import json
+import requests
+import xmltodict
+
+
+def http_get(address, port, req, query = None):
+    if query:
+        url = 'http://%s:%s/%s%s' %(address, port, req, query)
+    else:
+        url = 'http://%s:%s/%s' %(address, port, req)
+    print 'URL: %s' %url
+    r = requests.get(url)
+    #print json.dumps(xmltodict.parse(r.text))
+    d = xmltodict.parse(r.text)
+    data = d['__VnListResp_list']['VnListResp']['vn_list']['list']['VnSandeshData']
+    for i in data:
+        print i['name']['#text']
+
+class IntrospectVrouter():
+    def __init__(self, args):
+        self.address = args.address
+        self.port = 8085
+
+    def list_network(self):
+        http_get(self.address, self.port, 'Snh_VnListReq')
+
+    def list_vm(self):
+        print 'list vm'
+
+    def list(self, args):
+        list_obj = {'network': self.list_network,
+                    'vm': self.list_vm}
+        if args.obj in list_obj.keys():
+            list_obj[args.obj]()
+        else:
+            print 'ERROR: Object %s is invalid!' %args.obj
+
+    def show(self, args):
+        print 'show: %s' %args
+
+class IntrospectControl():
+    def __init__(self, args):
+        self.address = args.address
+        self.port = 8083
+
+    def list(self, args):
+        print 'list: %s' %args
+
+    def show(self, args):
+        print 'show: %s' %args
+
+
+class IntrospectCli():
+
+    def __init__(self):
+        pass
+
+    def add_common_parser(self, obj_name, obj_desc, obj_class,
+            ps_list, ps_show):
+        p = ps_list.add_parser(obj_name, help = obj_desc)
+        p.set_defaults(obj_class = obj_class, obj_func = 'list')
+        p.add_argument('--all', action = 'store_true', help = 'All objects')
+
+        p = ps_show.add_parser(obj_name, help = obj_desc)
+        p.set_defaults(obj_class = obj_class, obj_func = 'show')
+        p.add_argument('name', default = None,
+                metavar = '<name>', help = 'The name')
+        p.add_argument('--format',
+                choices = ['default', 'json', 'dump', 'dict'],
+                default = 'default', metavar = '<format>',
+                help = 'The object format ' \
+                       '[ default | json | dump | dict ]')
+
+    def add_list_parser(self, op_parsers, obj_list, svc_class):
+        op = 'list'
+        op_p = op_parsers.add_parser(op)
+        obj_parsers = op_p.add_subparsers(metavar = '<object>')
+        for obj in obj_list:
+            obj_p = obj_parsers.add_parser(obj)
+            obj_p.set_defaults(svc_class = svc_class, op = op, obj = obj)
+
+
+    def parser_init(self):
+        parser = argparse.ArgumentParser()
+        self.parser = parser
+
+        svc_parsers = parser.add_subparsers(metavar = '<service>')
+
+        #### Vrouter ####
+        svc_class = IntrospectVrouter
+        svc_p = svc_parsers.add_parser('vrouter')
+        svc_p.add_argument('address', help = 'Service address')
+        op_parsers = svc_p.add_subparsers(metavar = '<operation>')
+
+        obj_list = ['network', 'vm', 'vrf']
+        self.add_list_parser(op_parsers, obj_list, svc_class)
+
+        op = 'show'
+        op_p = op_parsers.add_parser(op)
+        obj_parsers = op_p.add_subparsers(metavar = '<object>')
+
+        obj = 'network'
+        obj_p = obj_parsers.add_parser(obj)
+        obj_p.set_defaults(svc_class = svc_class, op = op, obj = obj)
+
+        obj = 'vm'
+        obj_p = obj_parsers.add_parser(obj)
+        obj_p.set_defaults(svc_class = svc_class, op = op, obj = obj)
+
+        #### Control ####
+        svc_class = IntrospectControl
+        svc_p = svc_parsers.add_parser('control')
+        svc_p.add_argument('address', help = 'Service address')
+        op_parsers = svc_p.add_subparsers(metavar = '<operation>')
+
+        obj_list = ['network', 'vm', 'vrf']
+        self.add_list_parser(op_parsers, obj_list, svc_class)
+
+        op = 'show'
+        op_p = op_parsers.add_parser(op)
+        obj_parsers = op_p.add_subparsers(metavar = '<object>')
+
+        obj = 'network'
+        obj_p = obj_parsers.add_parser(obj)
+        obj_p.set_defaults(svc_class = svc_class, op = op, obj = obj)
+
+        obj = 'vm'
+        obj_p = obj_parsers.add_parser(obj)
+        obj_p.set_defaults(svc_class = svc_class, op = op, obj = obj)
+
+
+    def run(self):
+        self.parser_init()
+        args = self.parser.parse_args()
+        #print args
+        #return
+        svc = args.svc_class(args)
+        func = getattr(svc, args.op)
+        func(args)
+
+
+if __name__ == '__main__':
+    IntrospectCli().run()
+
