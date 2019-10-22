@@ -65,7 +65,7 @@ class SriovCli():
         return p.stdout.read()
 
     def update_network(self, name):
-        print '\nCheck virtual network %s...' %name
+        print '\n# Check virtual network %s...' %name
         try:
             obj = self.vnc.virtual_network_read(
                     fq_name = self.tenant.fq_name + [name])
@@ -75,16 +75,16 @@ class SriovCli():
         pp = obj.get_provider_properties()
         if pp and (pp.physical_network == sriov_physical_network) and \
                 (pp.segmentation_id == obj.virtual_network_network_id):
-            print 'Skip.'
+            print '# Skip.'
         else:
-            print 'Update virtual network %s...' %name
+            print '# Update virtual network %s...' %name
             pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
                     sriov_physical_network)
             obj.set_provider_properties(pp)
             self.vnc.virtual_network_update(obj)
 
     def create_vm_port(self, args):
-        print '\nCreate VM port...'
+        print '\n# Create VM port...'
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
@@ -126,7 +126,7 @@ class SriovCli():
             return
         print 'VM port %s is created.' %id
 
-        print '\nAllocate instance IP address...'
+        print '\n# Allocate instance IP address...'
         id = str(uuid.uuid4())
         ip = vnc_api.InstanceIp(name = id)
         ip.uuid = id
@@ -142,7 +142,7 @@ class SriovCli():
         return vmi.uuid
 
     def launch_vm(self, name, port_id):
-        print '\nLaunch VM on port %s...' %port_id
+        print '\n# Launch VM on port %s...' %port_id
         os_args = 'server create --image centos --flavor m1.small ' + \
                 '--port %s --availability-zone az-1 %s' %(port_id, name)
         self.openstack_cli(os_args)
@@ -156,12 +156,12 @@ class SriovCli():
             time.sleep(5)
 
     def get_device_info(self, api_server, compute):
-        print 'Get device and port...'
+        print '# Get device and port...'
         url = 'http://%s:8081/analytics/uves/prouters' %api_server
         response = requests.get(url)
         dev_list = response.json()
         for dev in dev_list:
-            print 'Check device %s...' %dev['name']
+            print '# Check device %s...' %dev['name']
             dev_resp = requests.get(dev['href'])
             dev_body = dev_resp.json()
             lldp_table = dev_body['PRouterEntry']['lldpTable']
@@ -173,25 +173,25 @@ class SriovCli():
             break
         else:
             print 'ERROR: Not found device and port for %s!' %compute
-            return
+            return None, None
 
         for l in lldp_table['lldpLocalSystemData']['lldpLocPortTable']:
             if l['lldpLocPortNum'] == r['lldpRemLocalPortNum']:
                 break
         else:
             print 'ERROR: Not found local port for %s!' %compute
-            return
+            return None, None
         return dev_body, l['lldpLocPortId']
 
     def create_device_port(self, args):
-        print '\nCreate device port...'
-        print 'Get VM ID...'
+        print '\n# Create device port...'
+        print '# Get VM ID...'
         os_args = 'server show %s -c id -f value' %args.name
         vm_id = self.openstack_cli(os_args).rstrip()
         vm = self.vnc.virtual_machine_read(id = vm_id)
         print '%s' %vm_id
 
-        print 'Get compute node...'
+        print '# Get compute node...'
         os_args = 'server show %s -c "OS-EXT-SRV-ATTR:host" -f value' \
                 %args.name
         compute = self.openstack_cli(os_args).rstrip()
