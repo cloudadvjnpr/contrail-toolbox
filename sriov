@@ -155,8 +155,101 @@ class SriovCli():
                 break
             time.sleep(5)
 
+    def get_device_info(self, api_server, compute):
+        print 'Get device and port...'
+        url = 'http://%s:8081/analytics/uves/prouters' %api_server
+        response = requests.get(url)
+        dev_list = response.json()
+        for dev in dev_list:
+            print 'Check device %s...' %dev['name']
+            dev_resp = requests.get(dev['href'])
+            dev_body = dev_resp.json()
+            lldp_table = dev_body['PRouterEntry']['lldpTable']
+            for r in lldp_table['lldpRemoteSystemsData']:
+                if r['lldpRemSysName'] == compute:
+                    break
+            else:
+                continue
+            break
+        else:
+            print 'ERROR: Not found device and port for %s!' %compute
+            return
+
+        for l in lldp_table['lldpLocalSystemData']['lldpLocPortTable']:
+            if l['lldpLocPortNum'] == r['lldpRemLocalPortNum']:
+                break
+        else:
+            print 'ERROR: Not found local port for %s!' %compute
+            return
+        return dev_body, l['lldpLocPortId']
+
     def create_device_port(self, args):
         print '\nCreate device port...'
+        print 'Get VM ID...'
+        os_args = 'server show %s -c id -f value' %args.name
+        vm_id = self.openstack_cli(os_args).rstrip()
+        vm = self.vnc.virtual_machine_read(id = vm_id)
+        print '%s' %vm_id
+
+        print 'Get compute node...'
+        os_args = 'server show %s -c "OS-EXT-SRV-ATTR:host" -f value' \
+                %args.name
+        compute = self.openstack_cli(os_args).rstrip()
+        print '%s' %compute
+
+        dev_body, dev_port = self.get_device_info(args.api_server, compute)
+        if not dev_body:
+            print 'ERROR: Not found device for %s!' %compute
+            return
+        conf = dev_body['ContrailConfig']['elements']
+        fabric_fqn = json.loads(conf['fabric_refs'])[0]['to']
+        dev_name = json.loads(conf['fq_name'])[1]
+        print 'device name: %s' %dev_name
+        print 'device port: %s' %dev_port
+        print 'fabric: %s' %fabric_fqn
+        return
+
+        id = str(uuid.uuid4())
+        vmi = vnc_api.VirtualMachineInterface(name = id,
+                parent_obj = self.tenant)
+        vmi.uuid = id
+        vn = self.vnc.virtual_network_read(
+                fq_name = self.tenant.fq_name + [args.network])
+        vmi.set_virtual_network(vn)
+        vmi.set_virtual_machine(vm)
+        kvp_list= [
+                {
+                    'key': 'profile',
+                    'value': '{"physical_network": "sriov"}'
+                },
+                {
+                    'key': 'host_id',
+                    'value': 'null'
+                },
+                {
+                    'key': 'vnic_type',
+                    'value': 'direct'
+                },
+                {
+                    'key': 'vif_details',
+                    'value': '{"port_filter": true, "vlan": "10"}'
+                },
+                {
+                    'key': 'vif_type',
+                    'value': 'hw_veb'
+                }
+            ]
+        kvps = vnc_api.KeyValuePairs()
+        for kvp in kvp_list:
+            kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
+                    value = kvp['value']))
+        vmi.set_virtual_machine_interface_bindings(kvps)
+        try:
+            self.vnc.virtual_machine_interface_create(vmi)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        print 'VM port %s is created.' %id
 
     def cmd_launch_vm(self, args):
         print '\nLaunch SRIOV VM...'
@@ -212,7 +305,7 @@ class SriovCli():
         connect = ConfigConnect(args)
         self.vnc = connect.vnc
         self.tenant = connect.tenant
-        cmd_map = {'launch-vm': self.cmd_launch_vm,
+        cmd_map = {'launch-vm': self.create_device_port,
                    'delete-vm': self.cmd_delete_vm}
         func = cmd_map.get(args.cmd)
         if func:
