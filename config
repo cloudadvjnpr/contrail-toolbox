@@ -96,7 +96,10 @@ class ConfigResource():
             print fqn_to_str(res['fq_name'])
 
     def show_resource(self, args):
-        if ':' in args.res_name:
+        id = None
+        if (len(args.res_name) == 36) and (args.res_name.count('-') == 4):
+            id = args.res_name
+        elif ':' in args.res_name:
             fq_name = str_to_fqn(args.res_name)
         else:
             fq_name = self.tenant.fq_name + [args.res_name]
@@ -104,7 +107,10 @@ class ConfigResource():
         func_name = cls.object_type + '_read'
         func = getattr(self.vnc, func_name)
         try:
-            res = func(fq_name = fq_name)
+            if id:
+                res = func(id = id)
+            else:
+                res = func(fq_name = fq_name)
         except Exception as e:
             print 'ERROR: %s' %(str(e))
             return
