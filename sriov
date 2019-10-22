@@ -34,11 +34,19 @@ default_args = [
 class ConfigConnect():
     def __init__(self, args):
         self.controller = args.api_server
-        self.vnc = vnc_api.VncApi(username = args.auth_username,
-                password = args.auth_password, tenant_name = args.auth_tenant,
-                domain_name = args.auth_domain,
-                api_server_host = args.api_server,
-                auth_host = args.auth_server, auth_url = args.auth_url)
+        self.vnc = None
+        try:
+            self.vnc = vnc_api.VncApi(
+                    username = args.auth_username,
+                    password = args.auth_password,
+                    tenant_name = args.auth_tenant,
+                    domain_name = args.auth_domain,
+                    api_server_host = args.api_server,
+                    auth_host = args.auth_server,
+                    auth_url = args.auth_url)
+        except:
+            print 'ERROR: Failed to connect to configuration API server!'
+            return
         try:
             self.tenant = self.vnc.project_read(
                     fq_name = [args.domain, args.tenant])
@@ -303,6 +311,8 @@ class SriovCli():
         args = self.parser.parse_args()
         #print 'args: %s' %args
         connect = ConfigConnect(args)
+        if not connect.vnc:
+            return
         self.vnc = connect.vnc
         self.tenant = connect.tenant
         cmd_map = {'launch-vm': self.create_device_port,
