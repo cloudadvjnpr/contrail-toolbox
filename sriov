@@ -17,6 +17,8 @@ from vnc_api.gen import resource_client
 from vnc_api.gen import resource_xsd
 from cfgm_common import _obj_serializer_all
 
+compute_username = 'root'
+compute_password = 'c0ntrail123'
 sriov_physical_network = 'sriov'
 
 default_args = [
@@ -170,10 +172,12 @@ class SriovCli():
         addr = vrouter_obj.get_virtual_router_ip_address()
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(addr, username = 'root', password = 'Poclab123!')
+        ssh.connect(addr, username = compute_username,
+                password = compute_password)
         stdin, stdout, stderr = ssh.exec_command('./get-pf %s' %mac)
+        pf_name = stdout.read().rstrip()
         ssh.close()
-        return stdout.read()
+        return pf_name
 
     def get_device_info(self, api_server, compute, pf_name):
         print '# Get device and port...'
@@ -184,6 +188,9 @@ class SriovCli():
             print '# Check device %s...' %dev['name']
             dev_resp = requests.get(dev['href'])
             dev_body = dev_resp.json()
+            if not dev_body.has_key('PRouterLinkEntry'):
+                print 'No link table.'
+                continue
             link_table = dev_body['PRouterLinkEntry']['link_table']
             for link in link_table:
                 if (link['remote_system_name'] == compute) and \
@@ -196,7 +203,9 @@ class SriovCli():
             print 'ERROR: Not found device and port for %s!' %compute
             return None, None
 
-        return dev, link['local_interface_name']
+        conf = dev_body['ContrailConfig']['elements']
+        fabric_fqn = json.loads(conf['fabric_refs'])[0]['to']
+        return dev, link['local_interface_name'], fabric_fqn
 
 
     def configure_device_port(self, args, port_id):
@@ -219,14 +228,11 @@ class SriovCli():
         pf_name = self.get_pf_name(compute, mac)
         print 'PF device is %s.' %pf_name
 
-        dev_name, dev_port = self.get_device_info(args.api_server, compute,
-                pf_name)
-        if not dev_body:
+        dev_name, dev_port, fabric_fqn = self.get_device_info(
+                args.api_server, compute, pf_name)
+        if not dev_name:
             print 'ERROR: Not found device for %s!' %compute
             return
-        conf = dev_body['ContrailConfig']['elements']
-        fabric_fqn = json.loads(conf['fabric_refs'])[0]['to']
-        dev_name = json.loads(conf['fq_name'])[1]
         print 'device name: %s' %dev_name
         print 'device port: %s' %dev_port
         print 'fabric: %s' %fabric_fqn
