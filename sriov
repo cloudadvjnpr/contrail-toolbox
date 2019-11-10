@@ -11,6 +11,7 @@ import json
 import yaml
 import requests
 import pprint
+import paramiko
 from vnc_api import vnc_api
 from vnc_api.gen import resource_client
 from vnc_api.gen import resource_xsd
@@ -83,23 +84,23 @@ class SriovCli():
         pp = obj.get_provider_properties()
         if pp and (pp.physical_network == sriov_physical_network) and \
                 (pp.segmentation_id == obj.virtual_network_network_id):
-            print '# Skip.'
+            print 'Skip.'
         else:
             print '# Update virtual network %s...' %name
             pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
                     sriov_physical_network)
             obj.set_provider_properties(pp)
             self.vnc.virtual_network_update(obj)
+        return obj
 
-    def create_vm_port(self, args):
+    def create_vm_port(self, args, vn_obj):
         print '\n# Create VM port...'
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
         vmi.uuid = id
-        vn = self.vnc.virtual_network_read(
-                fq_name = self.tenant.fq_name + [args.network])
-        vmi.set_virtual_network(vn)
+        vmi.set_virtual_network(vn_obj)
+        vlan_id = vn_obj.get_virtual_network_network_id()
         kvp_list= [
                 {
                     'key': 'profile',
@@ -115,7 +116,7 @@ class SriovCli():
                 },
                 {
                     'key': 'vif_details',
-                    'value': '{"port_filter": true, "vlan": "10"}'
+                    'value': '{"port_filter": true, "vlan": "%d"}' %vlan_id
                 },
                 {
                     'key': 'vif_type',
@@ -139,7 +140,7 @@ class SriovCli():
         ip = vnc_api.InstanceIp(name = id)
         ip.uuid = id
         ip.add_virtual_machine_interface(vmi)
-        ip.add_virtual_network(vn)
+        ip.add_virtual_network(vn_obj)
         try:
             self.vnc.instance_ip_create(ip)
         except Exception as e:
@@ -163,7 +164,18 @@ class SriovCli():
                 break
             time.sleep(5)
 
-    def get_device_info(self, api_server, compute):
+    def get_pf_name(self, compute, mac):
+        vrouter_obj = self.vnc.virtual_router_read(
+                fq_name = ['default-global-system-config', compute])
+        addr = vrouter_obj.get_virtual_router_ip_address()
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(addr, username = 'root', password = 'Poclab123!')
+        stdin, stdout, stderr = ssh.exec_command('./get-pf %s' %mac)
+        ssh.close()
+        return stdout.read()
+
+    def get_device_info(self, api_server, compute, pf_name):
         print '# Get device and port...'
         url = 'http://%s:8081/analytics/uves/prouters' %api_server
         response = requests.get(url)
@@ -172,9 +184,10 @@ class SriovCli():
             print '# Check device %s...' %dev['name']
             dev_resp = requests.get(dev['href'])
             dev_body = dev_resp.json()
-            lldp_table = dev_body['PRouterEntry']['lldpTable']
-            for r in lldp_table['lldpRemoteSystemsData']:
-                if r['lldpRemSysName'] == compute:
+            link_table = dev_body['PRouterLinkEntry']['link_table']
+            for link in link_table:
+                if (link['remote_system_name'] == compute) and \
+                        (pf_name in link['remote_interface_name']):
                     break
             else:
                 continue
@@ -183,29 +196,31 @@ class SriovCli():
             print 'ERROR: Not found device and port for %s!' %compute
             return None, None
 
-        for l in lldp_table['lldpLocalSystemData']['lldpLocPortTable']:
-            if l['lldpLocPortNum'] == r['lldpRemLocalPortNum']:
+        return dev, link['local_interface_name']
+
+
+    def configure_device_port(self, args, port_id):
+        print '\n# Configure device port...'
+        print '# Get VM port...'
+        port_obj = self.vnc.virtual_machine_interface_read(id = port_id)
+
+        bindings = port_obj.get_virtual_machine_interface_bindings()
+        for kvp in bindings.get_key_value_pair():
+            if kvp.key == 'host_id':
                 break
         else:
-            print 'ERROR: Not found local port for %s!' %compute
-            return None, None
-        return dev_body, l['lldpLocPortId']
+            print 'ERROR: Not found "host_id" in port %s!' %port_id
+            return
+        compute = kvp.value
+        mac = port_obj.get_virtual_machine_interface_mac_addresses().get_mac_address()[0]
+        print 'Port is on compute node %s, MAC %s' %(compute, mac)
 
-    def create_device_port(self, args):
-        print '\n# Create device port...'
-        print '# Get VM ID...'
-        os_args = 'server show %s -c id -f value' %args.name
-        vm_id = self.openstack_cli(os_args).rstrip()
-        vm = self.vnc.virtual_machine_read(id = vm_id)
-        print '%s' %vm_id
+        print '# Get PF device name...'
+        pf_name = self.get_pf_name(compute, mac)
+        print 'PF device is %s.' %pf_name
 
-        print '# Get compute node...'
-        os_args = 'server show %s -c "OS-EXT-SRV-ATTR:host" -f value' \
-                %args.name
-        compute = self.openstack_cli(os_args).rstrip()
-        print '%s' %compute
-
-        dev_body, dev_port = self.get_device_info(args.api_server, compute)
+        dev_name, dev_port = self.get_device_info(args.api_server, compute,
+                pf_name)
         if not dev_body:
             print 'ERROR: Not found device for %s!' %compute
             return
@@ -260,19 +275,25 @@ class SriovCli():
         print 'VM port %s is created.' %id
 
     def cmd_launch_vm(self, args):
-        print '\nLaunch SRIOV VM...'
+        print '\n# Launch SRIOV VM...'
         if not args.network:
             print 'ERROR: Argument "network" is missing!'
             return
-        self.update_network(args.network)
-        port_id = self.create_vm_port(args)
-        if not port_id:
-            return
-        self.launch_vm(args.name, port_id)
-        self.create_device_port(args)
+        if args.trunk:
+            print "trunk"
+        else:
+            #vn_obj = self.update_network(args.network)
+            #if not vn_obj:
+            #    return
+            #port_id = self.create_vm_port(args, vn_obj)
+            #if not port_id:
+            #    return
+            #self.launch_vm(args.name, port_id)
+            port_id = 'b48e3ef7-b788-40f1-ac6e-1864c9f7d0d2'
+            self.configure_device_port(args, port_id)
 
     def cmd_delete_vm(self, args):
-        print '\nDelete SRIOV VM...'
+        print '\n# Delete SRIOV VM...'
         os_args = 'server show %s -c id -f value' %args.name
         vm_id = self.openstack_cli(os_args).rstrip()
         vm = self.vnc.virtual_machine_read(id = vm_id)
@@ -305,17 +326,20 @@ class SriovCli():
         parser.add_argument('cmd', help = 'Command')
         parser.add_argument('name', help = 'Name')
         parser.add_argument('--network', help = 'Virtual network')
+        parser.add_argument('--trunk', action = 'store_true',
+                help = 'Trunk VF')
 
     def start(self):
         self.parser_init()
         args = self.parser.parse_args()
         #print 'args: %s' %args
+        #return
         connect = ConfigConnect(args)
         if not connect.vnc:
             return
         self.vnc = connect.vnc
         self.tenant = connect.tenant
-        cmd_map = {'launch-vm': self.create_device_port,
+        cmd_map = {'launch-vm': self.cmd_launch_vm,
                    'delete-vm': self.cmd_delete_vm}
         func = cmd_map.get(args.cmd)
         if func:
