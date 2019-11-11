@@ -95,7 +95,13 @@ class SriovCli():
             self.vnc.virtual_network_update(obj)
         return obj
 
-    def create_vm_port(self, args, vn_obj):
+    def create_vm_port_openstack(self, args, vn_obj):
+        os_args = 'port create --network %s --vnic-type direct ' + \
+                '-c id -f value %s' \
+                %(args.network, args.name + '-' + args.network)
+        return self.openstack_cli(os_args).rstrip()
+
+    def create_vm_port_contrail(self, args, vn_obj):
         print '\n# Create VM port...'
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
@@ -107,10 +113,6 @@ class SriovCli():
                 {
                     'key': 'profile',
                     'value': '{"physical_network": "sriov"}'
-                },
-                {
-                    'key': 'host_id',
-                    'value': 'null'
                 },
                 {
                     'key': 'vnic_type',
@@ -152,10 +154,14 @@ class SriovCli():
         print 'IP address %s is allocated.' %ip.get_instance_ip_address()
         return vmi.uuid
 
-    def launch_vm(self, name, port_id):
+    def launch_vm(self, args, port_id):
+        name = args.name
+        az = args.az
+        if not az:
+            az = 'az-1'
         print '\n# Launch VM on port %s...' %port_id
         os_args = 'server create --image centos --flavor m1.small ' + \
-                '--port %s --availability-zone az-1 %s' %(port_id, name)
+                '--port %s --availability-zone %s %s' %(port_id, az, name)
         self.openstack_cli(os_args)
 
         while (1):
@@ -221,7 +227,8 @@ class SriovCli():
             print 'ERROR: Not found "host_id" in port %s!' %port_id
             return
         compute = kvp.value
-        mac = port_obj.get_virtual_machine_interface_mac_addresses().get_mac_address()[0]
+        mac_list_obj = port_obj.get_virtual_machine_interface_mac_addresses()
+        mac = mac_list_obj.get_mac_address()[0]
         print 'Port is on compute node %s, MAC %s' %(compute, mac)
 
         print '# Get PF device name...'
@@ -233,6 +240,11 @@ class SriovCli():
         if not dev_name:
             print 'ERROR: Not found device for %s!' %compute
             return
+        dev_name = dev_name.split('.')[0]
+        dev_obj = self.vnc.physical_router_read(
+            fq_name = ['default-global-system-config', dev_name])
+        fabric_name = dev_obj.get_fabric_refs()[0]['to'][1]
+        print 'fabric name: %s' %fabric_name
         print 'device name: %s' %dev_name
         print 'device port: %s' %dev_port
         return
@@ -244,27 +256,37 @@ class SriovCli():
         vmi.set_virtual_network(vn_obj)
         vm_obj = vnc_api.virtual_machine_read(id = vm_id)
         vmi.set_virtual_machine(vm_obj)
+        profile_dict = {'local_link_information':
+                    [
+                        {
+                            'port_id': dev_port,
+                            'switch_id': dev_port,
+                            'switch_info': dev_name,
+                            'fabric': fabric_name
+                        }
+                    ]
+                }
         kvp_list= [
                 {
-                    'key': 'profile',
-                    'value': '{"physical_network": "sriov"}'
-                },
-                {
-                    'key': 'host_id',
-                    'value': 'null'
-                },
-                {
                     'key': 'vnic_type',
-                    'value': 'direct'
-                },
-                {
-                    'key': 'vif_details',
-                    'value': '{"port_filter": true, "vlan": "10"}'
+                    'value': 'baremetal'
                 },
                 {
                     'key': 'vif_type',
-                    'value': 'hw_veb'
-                }
+                    'value': 'vrouter'
+                },
+                {
+                    'key': 'vpg',
+                    'value': 'vpg'
+                },
+                {
+                    'key': 'tor_port_vlan_id',
+                    'value': '4096'
+                },
+                {
+                    'key': 'profile',
+                    'value': json.dumps(profile_dict)
+                },
             ]
         kvps = vnc_api.KeyValuePairs()
         for kvp in kvp_list:
@@ -289,7 +311,7 @@ class SriovCli():
             vn_obj = self.update_network(args.network)
             if not vn_obj:
                 return
-            #port_id = self.create_vm_port(args, vn_obj)
+            #port_id = self.create_vm_port_contrail(args, vn_obj)
             #if not port_id:
             #    return
             #vm_id = self.launch_vm(args.name, port_id)
@@ -300,7 +322,7 @@ class SriovCli():
             self.create_device_port(args, vn_obj, vm_id, port_id)
 
     def cmd_delete_vm(self, args):
-        print '\n# Delete SRIOV VM...'
+        print '\n# Delete VM...'
         os_args = 'server show %s -c id -f value' %args.name
         vm_id = self.openstack_cli(os_args).rstrip()
         vm = self.vnc.virtual_machine_read(id = vm_id)
@@ -333,6 +355,7 @@ class SriovCli():
         parser.add_argument('cmd', help = 'Command')
         parser.add_argument('name', help = 'Name')
         parser.add_argument('--network', help = 'Virtual network')
+        parser.add_argument('--az', help = 'Availability zone')
         parser.add_argument('--trunk', action = 'store_true',
                 help = 'Trunk VF')
 
