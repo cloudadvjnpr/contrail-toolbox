@@ -159,11 +159,13 @@ class SriovCli():
         self.openstack_cli(os_args)
 
         while (1):
-            os_args = 'server show %s -c status -f value' %name
-            vm_state = self.openstack_cli(os_args).rstrip()
-            print 'VM State: %s' %vm_state
-            if vm_state == 'ACTIVE':
-                break
+            os_args = 'server show %s -c status -c id -f json' %name
+            output = json.loads(self.openstack_cli(os_args))
+            print 'VM State: %s' %output['status']
+            if output['status'] == 'ACTIVE':
+                return output['id']
+            elif output['status'] == 'ERROR':
+                return None
             time.sleep(5)
 
     def get_pf_name(self, compute, mac):
@@ -203,12 +205,10 @@ class SriovCli():
             print 'ERROR: Not found device and port for %s!' %compute
             return None, None
 
-        conf = dev_body['ContrailConfig']['elements']
-        fabric_fqn = json.loads(conf['fabric_refs'])[0]['to']
-        return dev, link['local_interface_name'], fabric_fqn
+        return dev['name'], link['local_interface_name']
 
 
-    def configure_device_port(self, args, port_id):
+    def create_device_port(self, args, vn_obj, vm_id, port_id):
         print '\n# Configure device port...'
         print '# Get VM port...'
         port_obj = self.vnc.virtual_machine_interface_read(id = port_id)
@@ -228,24 +228,22 @@ class SriovCli():
         pf_name = self.get_pf_name(compute, mac)
         print 'PF device is %s.' %pf_name
 
-        dev_name, dev_port, fabric_fqn = self.get_device_info(
-                args.api_server, compute, pf_name)
+        dev_name, dev_port = self.get_device_info(args.api_server,
+                compute, pf_name)
         if not dev_name:
             print 'ERROR: Not found device for %s!' %compute
             return
         print 'device name: %s' %dev_name
         print 'device port: %s' %dev_port
-        print 'fabric: %s' %fabric_fqn
         return
 
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
         vmi.uuid = id
-        vn = self.vnc.virtual_network_read(
-                fq_name = self.tenant.fq_name + [args.network])
-        vmi.set_virtual_network(vn)
-        vmi.set_virtual_machine(vm)
+        vmi.set_virtual_network(vn_obj)
+        vm_obj = vnc_api.virtual_machine_read(id = vm_id)
+        vmi.set_virtual_machine(vm_obj)
         kvp_list= [
                 {
                     'key': 'profile',
@@ -288,15 +286,18 @@ class SriovCli():
         if args.trunk:
             print "trunk"
         else:
-            #vn_obj = self.update_network(args.network)
-            #if not vn_obj:
-            #    return
+            vn_obj = self.update_network(args.network)
+            if not vn_obj:
+                return
             #port_id = self.create_vm_port(args, vn_obj)
             #if not port_id:
             #    return
-            #self.launch_vm(args.name, port_id)
+            #vm_id = self.launch_vm(args.name, port_id)
+            #if not vm_id:
+            #    return
+            vm_id = '51c6a916-b3f4-40c5-bae2-9d08e39125fd'
             port_id = 'b48e3ef7-b788-40f1-ac6e-1864c9f7d0d2'
-            self.configure_device_port(args, port_id)
+            self.create_device_port(args, vn_obj, vm_id, port_id)
 
     def cmd_delete_vm(self, args):
         print '\n# Delete SRIOV VM...'
