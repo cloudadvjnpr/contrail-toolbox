@@ -98,7 +98,7 @@ class SriovCli():
     def create_vm_port_openstack(self, args, vn_obj):
         os_args = 'port create --network %s --vnic-type direct ' + \
                 '-c id -f value %s' \
-                %(args.network, args.name + '-' + args.network)
+                %(args.network, args.name + '_' + args.network)
         return self.openstack_cli(os_args).rstrip()
 
     def create_vm_port_contrail(self, args, vn_obj):
@@ -243,18 +243,31 @@ class SriovCli():
         dev_name = dev_name.split('.')[0]
         dev_obj = self.vnc.physical_router_read(
             fq_name = ['default-global-system-config', dev_name])
-        fabric_name = dev_obj.get_fabric_refs()[0]['to'][1]
-        print 'fabric name: %s' %fabric_name
+        fabric_fqn = dev_obj.get_fabric_refs()[0]['to']
+        print 'fabric name: %s' %fabric_fqn[1]
         print 'device name: %s' %dev_name
         print 'device port: %s' %dev_port
-        return
 
+        vpg_name = dev_name + '_' + dev_port
+        try:
+            vpg_obj = self.vnc.virtual_port_group_read(
+                    fq_name = fabric_fqn + [vpg_name])
+            print 'VGP %s is found.' %vpg_name
+        except Exception as e:
+            print 'Create VGP %s...' %vpg_name
+            fabric_obj = self.vnc.fabric_read(fq_name = fabric_fqn)
+            vpg_obj = vnc_api.VirtualPortGroup(parent_obj = fabric_obj,
+                    name = vpg_name)
+            self.vnc.virtual_port_group_create(vpg_obj)
+            print 'VGP %s is created.' %vpg_name
+
+        vlan_id = vn_obj.get_virtual_network_network_id()
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
         vmi.uuid = id
         vmi.set_virtual_network(vn_obj)
-        vm_obj = vnc_api.virtual_machine_read(id = vm_id)
+        vm_obj = self.vnc.virtual_machine_read(id = vm_id)
         vmi.set_virtual_machine(vm_obj)
         profile_dict = {'local_link_information':
                     [
@@ -262,7 +275,7 @@ class SriovCli():
                             'port_id': dev_port,
                             'switch_id': dev_port,
                             'switch_info': dev_name,
-                            'fabric': fabric_name
+                            'fabric': fabric_fqn[1]
                         }
                     ]
                 }
@@ -277,7 +290,7 @@ class SriovCli():
                 },
                 {
                     'key': 'vpg',
-                    'value': 'vpg'
+                    'value': vpg_name
                 },
                 {
                     'key': 'tor_port_vlan_id',
@@ -293,6 +306,9 @@ class SriovCli():
             kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
                     value = kvp['value']))
         vmi.set_virtual_machine_interface_bindings(kvps)
+        prop = vnc_api.VirtualMachineInterfacePropertiesType(
+                sub_interface_vlan_tag = vlan_id)
+        vmi.set_virtual_machine_interface_properties(prop)
         try:
             self.vnc.virtual_machine_interface_create(vmi)
         except Exception as e:
@@ -311,32 +327,32 @@ class SriovCli():
             vn_obj = self.update_network(args.network)
             if not vn_obj:
                 return
-            #port_id = self.create_vm_port_contrail(args, vn_obj)
-            #if not port_id:
-            #    return
-            #vm_id = self.launch_vm(args.name, port_id)
-            #if not vm_id:
-            #    return
-            vm_id = '51c6a916-b3f4-40c5-bae2-9d08e39125fd'
-            port_id = 'b48e3ef7-b788-40f1-ac6e-1864c9f7d0d2'
+            port_id = self.create_vm_port_contrail(args, vn_obj)
+            if not port_id:
+                return
+            vm_id = self.launch_vm(args, port_id)
+            if not vm_id:
+                return
             self.create_device_port(args, vn_obj, vm_id, port_id)
 
     def cmd_delete_vm(self, args):
-        print '\n# Delete VM...'
+        print '\n# Delete VM %s...' %args.name
         os_args = 'server show %s -c id -f value' %args.name
         vm_id = self.openstack_cli(os_args).rstrip()
         vm = self.vnc.virtual_machine_read(id = vm_id)
         vmi_ref_list = vm.get_virtual_machine_interface_back_refs()
         os_args = 'server delete %s' %args.name
         self.openstack_cli(os_args).rstrip()
+        print 'VM %s is deleted.' %args.name
         for vmi_ref in vmi_ref_list:
-            print 'Delete port %s' %vmi_ref['uuid']
+            print '# Delete port %s...' %vmi_ref['uuid']
             vmi = self.vnc.virtual_machine_interface_read(id = vmi_ref['uuid'])
             iip_ref_list = vmi.get_instance_ip_back_refs()
             if iip_ref_list:
                 for iip_ref in iip_ref_list:
                     self.vnc.instance_ip_delete(id = iip_ref['uuid'])
             self.vnc.virtual_machine_interface_delete(id = vmi_ref['uuid'])
+            print 'Port %s is deleted.' %vmi_ref['uuid']
 
     def parser_init(self):
         parser = argparse.ArgumentParser()
