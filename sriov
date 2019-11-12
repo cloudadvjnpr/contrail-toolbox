@@ -75,24 +75,43 @@ class SriovCli():
         p = subprocess.Popen(cmd, stdout = subprocess.PIPE, shell = True)
         return p.stdout.read()
 
-    def update_network(self, name):
-        print '\n# Check virtual network %s...' %name
+    def create_trunk_network(self):
+        print '\n# Create trunk network sriov-0...'
         try:
             obj = self.vnc.virtual_network_read(
-                    fq_name = self.tenant.fq_name + [name])
+                    fq_name = self.tenant.fq_name + ['sriov-0'])
+            print 'Skip.'
+        except Exception as e:
+            os_args = 'network create --provider-physical-network sriov ' + \
+                    '--provider-segment 0 sriov-0'
+            self.openstack_cli(os_args)
+            os_args = 'subnet create --subnet-range 10.254.254.0/24 ' + \
+                    '--network sriov-0 sriov-0'
+            self.openstack_cli(os_args)
+            print 'Trunk network sriov-0 is created.'
+
+    def update_network(self, args):
+        print '\n# Update virtual network %s...' %args.network
+        try:
+            obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + [args.network])
         except Exception as e:
             print 'ERROR: %s' %(str(e))
             return
-        pp = obj.get_provider_properties()
-        if pp and (pp.physical_network == sriov_physical_network) and \
-                (pp.segmentation_id == obj.virtual_network_network_id):
-            print 'Skip.'
+
+        if args.trunk:
+            self.create_trunk_network()
         else:
-            print '# Update virtual network %s...' %name
-            pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
-                    sriov_physical_network)
-            obj.set_provider_properties(pp)
-            self.vnc.virtual_network_update(obj)
+            pp = obj.get_provider_properties()
+            if pp and (pp.physical_network == sriov_physical_network) and \
+                    (pp.segmentation_id == obj.virtual_network_network_id):
+                print 'Skip.'
+            else:
+                pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
+                        sriov_physical_network)
+                obj.set_provider_properties(pp)
+                self.vnc.virtual_network_update(obj)
+                print 'Virtual network %s is updated.' %args.network
         return obj
 
     def create_vm_port_openstack(self, args, vn_obj):
@@ -101,32 +120,20 @@ class SriovCli():
                 %(args.network, args.name + '_' + args.network)
         return self.openstack_cli(os_args).rstrip()
 
-    def create_vm_port_contrail(self, args, vn_obj):
+    def create_vm_port_contrail(self, args):
         print '\n# Create VM port...'
+        if args.trunk:
+            vn_obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + ['sriov-0'])
+        else:
+            vn_obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + [args.network])
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
         vmi.uuid = id
         vmi.set_virtual_network(vn_obj)
-        vlan_id = vn_obj.get_virtual_network_network_id()
-        kvp_list= [
-                {
-                    'key': 'profile',
-                    'value': '{"physical_network": "sriov"}'
-                },
-                {
-                    'key': 'vnic_type',
-                    'value': 'direct'
-                },
-                {
-                    'key': 'vif_details',
-                    'value': '{"port_filter": true, "vlan": "%d"}' %vlan_id
-                },
-                {
-                    'key': 'vif_type',
-                    'value': 'hw_veb'
-                }
-            ]
+        kvp_list= [{'key': 'vnic_type', 'value': 'direct'}]
         kvps = vnc_api.KeyValuePairs()
         for kvp in kvp_list:
             kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
@@ -214,7 +221,7 @@ class SriovCli():
         return dev['name'], link['local_interface_name']
 
 
-    def create_device_port(self, args, vn_obj, vm_id, port_id):
+    def create_device_port(self, args, vm_id, port_id):
         print '\n# Configure device port...'
         print '# Get VM port...'
         port_obj = self.vnc.virtual_machine_interface_read(id = port_id)
@@ -261,7 +268,8 @@ class SriovCli():
             self.vnc.virtual_port_group_create(vpg_obj)
             print 'VGP %s is created.' %vpg_name
 
-        vlan_id = vn_obj.get_virtual_network_network_id()
+        vn_obj = self.vnc.virtual_network_read(
+                fq_name = self.tenant.fq_name + [args.network])
         id = str(uuid.uuid4())
         vmi = vnc_api.VirtualMachineInterface(name = id,
                 parent_obj = self.tenant)
@@ -293,14 +301,17 @@ class SriovCli():
                     'value': vpg_name
                 },
                 {
-                    'key': 'tor_port_vlan_id',
-                    'value': '4096'
-                },
-                {
                     'key': 'profile',
                     'value': json.dumps(profile_dict)
                 },
             ]
+        if args.trunk:
+            vlan_id = 0
+            port_vlan = {'key': 'tor_port_vlan_id',
+                    'value': '1'}
+            kvp_list.append(port_vlan)
+        else:
+            vlan_id = vn_obj.get_virtual_network_network_id()
         kvps = vnc_api.KeyValuePairs()
         for kvp in kvp_list:
             kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
@@ -321,29 +332,32 @@ class SriovCli():
         if not args.network:
             print 'ERROR: Argument "network" is missing!'
             return
-        if args.trunk:
-            print "trunk"
-        else:
-            vn_obj = self.update_network(args.network)
-            if not vn_obj:
-                return
-            port_id = self.create_vm_port_contrail(args, vn_obj)
-            if not port_id:
-                return
-            vm_id = self.launch_vm(args, port_id)
-            if not vm_id:
-                return
-            self.create_device_port(args, vn_obj, vm_id, port_id)
+        vn_obj = self.update_network(args)
+        if not vn_obj:
+            return
+        port_id = self.create_vm_port_contrail(args)
+        if not port_id:
+            return
+        vm_id = self.launch_vm(args, port_id)
+        if not vm_id:
+            return
+        self.create_device_port(args, vm_id, port_id)
 
     def cmd_delete_vm(self, args):
         print '\n# Delete VM %s...' %args.name
         os_args = 'server show %s -c id -f value' %args.name
         vm_id = self.openstack_cli(os_args).rstrip()
-        vm = self.vnc.virtual_machine_read(id = vm_id)
-        vmi_ref_list = vm.get_virtual_machine_interface_back_refs()
+        vmi_ref_list = None
+        try:
+            vm = self.vnc.virtual_machine_read(id = vm_id)
+            vmi_ref_list = vm.get_virtual_machine_interface_back_refs()
+        except:
+            print 'VM %s is not found in Contrail.' %args.name
         os_args = 'server delete %s' %args.name
         self.openstack_cli(os_args).rstrip()
         print 'VM %s is deleted.' %args.name
+        if not vmi_ref_list:
+            return
         for vmi_ref in vmi_ref_list:
             print '# Delete port %s...' %vmi_ref['uuid']
             vmi = self.vnc.virtual_machine_interface_read(id = vmi_ref['uuid'])
