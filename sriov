@@ -181,7 +181,7 @@ class SriovCli():
                 return None
             time.sleep(5)
 
-    def get_pf_name(self, compute, mac):
+    def get_link_info(self, compute, mac):
         vrouter_obj = self.vnc.virtual_router_read(
                 fq_name = ['default-global-system-config', compute])
         addr = vrouter_obj.get_virtual_router_ip_address()
@@ -189,10 +189,10 @@ class SriovCli():
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(addr, username = compute_username,
                 password = compute_password)
-        stdin, stdout, stderr = ssh.exec_command('./get-pf %s' %mac)
-        pf_name = stdout.read().rstrip()
+        stdin, stdout, stderr = ssh.exec_command('./get-link %s' %mac)
+        link_info = json.loads(stdout.read())
         ssh.close()
-        return pf_name
+        return link_info
 
     def get_device_info(self, api_server, compute, pf_name):
         print '# Get device and port...'
@@ -233,21 +233,23 @@ class SriovCli():
         else:
             print 'ERROR: Not found "host_id" in port %s!' %port_id
             return
-        compute = kvp.value
+        compute = kvp.value.split('.')[0]
         mac_list_obj = port_obj.get_virtual_machine_interface_mac_addresses()
         mac = mac_list_obj.get_mac_address()[0]
         print 'Port is on compute node %s, MAC %s' %(compute, mac)
 
-        print '# Get PF device name...'
-        pf_name = self.get_pf_name(compute, mac)
-        print 'PF device is %s.' %pf_name
+        print '# Get link info...'
+        link_info = self.get_link_info(compute, mac)
+        print 'PF device is %s.' %link_info['local-port']
 
-        dev_name, dev_port = self.get_device_info(args.api_server,
-                compute, pf_name)
-        if not dev_name:
-            print 'ERROR: Not found device for %s!' %compute
-            return
-        dev_name = dev_name.split('.')[0]
+        #dev_name, dev_port = self.get_device_info(args.api_server,
+        #        compute, pf_name)
+        #if not dev_name:
+        #    print 'ERROR: Not found device for %s!' %compute
+        #    return
+
+        dev_name = link_info['remote-device'].split('.')[0]
+        dev_port = link_info['remote-port']
         dev_obj = self.vnc.physical_router_read(
             fq_name = ['default-global-system-config', dev_name])
         fabric_fqn = dev_obj.get_fabric_refs()[0]['to']
