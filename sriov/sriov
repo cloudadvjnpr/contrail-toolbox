@@ -1,0 +1,424 @@
+#!/usr/bin/python
+
+import os
+import sys
+import argparse
+import time
+import uuid
+import subprocess
+import socket
+import json
+import yaml
+import requests
+import pprint
+import paramiko
+from vnc_api import vnc_api
+from vnc_api.gen import resource_client
+from vnc_api.gen import resource_xsd
+from cfgm_common import _obj_serializer_all
+
+compute_username = 'root'
+compute_password = 'c0ntrail123'
+sriov_physical_network = 'sriov'
+
+default_args = [
+    ('auth-username', 'admin'),
+    ('auth-password', 'contrail123'),
+    ('auth-tenant', 'admin'),
+    ('auth-domain', 'default'),
+    ('auth-region', 'RegionOne'),
+    ('auth-server', '127.0.0.1'),
+    ('auth-url', '/v3/auth/tokens'),
+    ('api-server', '127.0.0.1'),
+    ('domain', 'default-domain'),
+    ('tenant', 'admin')]
+
+
+class ConfigConnect():
+    def __init__(self, args):
+        self.controller = args.api_server
+        self.vnc = None
+        try:
+            self.vnc = vnc_api.VncApi(
+                    username = args.auth_username,
+                    password = args.auth_password,
+                    tenant_name = args.auth_tenant,
+                    domain_name = args.auth_domain,
+                    api_server_host = args.api_server,
+                    auth_host = args.auth_server,
+                    auth_url = args.auth_url)
+        except:
+            print 'ERROR: Failed to connect to configuration API server!'
+            return
+        try:
+            self.tenant = self.vnc.project_read(
+                    fq_name = [args.domain, args.tenant])
+        except:
+            self.tenant = None
+
+class SriovCli():
+    def __init__(self):
+        self.vnc = None
+        self.tenant = None
+
+    def env(self, *args, **kwargs):
+        for arg in args:
+            value = os.environ.get(arg, None)
+            if value:
+                return value
+        return kwargs.get('default', '')
+
+    def openstack_cli(self, os_args):
+        env = '/var/lib/kolla/config_files/admin-openrc.sh'
+        cmd = 'docker exec kolla_toolbox bash -c "source %s; openstack %s"' \
+                %(env, os_args)
+        p = subprocess.Popen(cmd, stdout = subprocess.PIPE, shell = True)
+        return p.stdout.read()
+
+    def create_trunk_network(self):
+        print '\n# Create trunk network sriov-0...'
+        try:
+            obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + ['sriov-0'])
+            print 'Skip.'
+        except Exception as e:
+            os_args = 'network create --provider-physical-network sriov ' + \
+                    '--provider-segment 0 sriov-0'
+            self.openstack_cli(os_args)
+            os_args = 'subnet create --subnet-range 10.254.254.0/24 ' + \
+                    '--network sriov-0 sriov-0'
+            self.openstack_cli(os_args)
+            print 'Trunk network sriov-0 is created.'
+
+    def update_network(self, args):
+        print '\n# Update virtual network %s...' %args.network
+        try:
+            obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + [args.network])
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+
+        if args.trunk:
+            self.create_trunk_network()
+        else:
+            pp = obj.get_provider_properties()
+            if pp and (pp.physical_network == sriov_physical_network) and \
+                    (pp.segmentation_id == obj.virtual_network_network_id):
+                print 'Skip.'
+            else:
+                pp = vnc_api.ProviderDetails(obj.virtual_network_network_id,
+                        sriov_physical_network)
+                obj.set_provider_properties(pp)
+                self.vnc.virtual_network_update(obj)
+                print 'Virtual network %s is updated.' %args.network
+        return obj
+
+    def create_vm_port_openstack(self, args, vn_obj):
+        os_args = 'port create --network %s --vnic-type direct ' + \
+                '-c id -f value %s' \
+                %(args.network, args.name + '_' + args.network)
+        return self.openstack_cli(os_args).rstrip()
+
+    def create_vm_port_contrail(self, args):
+        print '\n# Create VM port...'
+        if args.trunk:
+            vn_obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + ['sriov-0'])
+        else:
+            vn_obj = self.vnc.virtual_network_read(
+                    fq_name = self.tenant.fq_name + [args.network])
+        id = str(uuid.uuid4())
+        vmi = vnc_api.VirtualMachineInterface(name = id,
+                parent_obj = self.tenant)
+        vmi.uuid = id
+        vmi.set_virtual_network(vn_obj)
+        kvp_list= [{'key': 'vnic_type', 'value': 'direct'}]
+        kvps = vnc_api.KeyValuePairs()
+        for kvp in kvp_list:
+            kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
+                    value = kvp['value']))
+        vmi.set_virtual_machine_interface_bindings(kvps)
+        try:
+            self.vnc.virtual_machine_interface_create(vmi)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        print 'VM port %s is created.' %id
+
+        print '\n# Allocate instance IP address...'
+        id = str(uuid.uuid4())
+        ip = vnc_api.InstanceIp(name = id)
+        ip.uuid = id
+        ip.add_virtual_machine_interface(vmi)
+        ip.add_virtual_network(vn_obj)
+        try:
+            self.vnc.instance_ip_create(ip)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        ip = self.vnc.instance_ip_read(id = id)
+        print 'IP address %s is allocated.' %ip.get_instance_ip_address()
+        return vmi.uuid
+
+    def launch_vm(self, args, port_id):
+        name = args.name
+        az = args.az
+        if not az:
+            az = 'az-1'
+        print '\n# Launch VM on port %s...' %port_id
+        os_args = 'server create --image centos --flavor m1.small ' + \
+                '--port %s --availability-zone %s %s' %(port_id, az, name)
+        self.openstack_cli(os_args)
+
+        while (1):
+            os_args = 'server show %s -c status -c id -f json' %name
+            output = json.loads(self.openstack_cli(os_args))
+            print 'VM State: %s' %output['status']
+            if output['status'] == 'ACTIVE':
+                return output['id']
+            elif output['status'] == 'ERROR':
+                return None
+            time.sleep(5)
+
+    def get_link_info(self, compute, mac):
+        vrouter_obj = self.vnc.virtual_router_read(
+                fq_name = ['default-global-system-config', compute])
+        addr = vrouter_obj.get_virtual_router_ip_address()
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(addr, username = compute_username,
+                password = compute_password)
+        stdin, stdout, stderr = ssh.exec_command('./get-link %s' %mac)
+        link_info = json.loads(stdout.read())
+        ssh.close()
+        return link_info
+
+    def get_device_info(self, api_server, compute, pf_name):
+        print '# Get device and port...'
+        url = 'http://%s:8081/analytics/uves/prouters' %api_server
+        response = requests.get(url)
+        dev_list = response.json()
+        for dev in dev_list:
+            print '# Check device %s...' %dev['name']
+            dev_resp = requests.get(dev['href'])
+            dev_body = dev_resp.json()
+            if not dev_body.has_key('PRouterLinkEntry'):
+                print 'No link table.'
+                continue
+            link_table = dev_body['PRouterLinkEntry']['link_table']
+            for link in link_table:
+                if (link['remote_system_name'] == compute) and \
+                        (pf_name in link['remote_interface_name']):
+                    break
+            else:
+                continue
+            break
+        else:
+            print 'ERROR: Not found device and port for %s!' %compute
+            return None, None
+
+        return dev['name'], link['local_interface_name']
+
+
+    def create_device_port(self, args, vm_id, port_id):
+        print '\n# Configure device port...'
+        print '# Get VM port...'
+        port_obj = self.vnc.virtual_machine_interface_read(id = port_id)
+
+        bindings = port_obj.get_virtual_machine_interface_bindings()
+        for kvp in bindings.get_key_value_pair():
+            if kvp.key == 'host_id':
+                break
+        else:
+            print 'ERROR: Not found "host_id" in port %s!' %port_id
+            return
+        compute = kvp.value.split('.')[0]
+        mac_list_obj = port_obj.get_virtual_machine_interface_mac_addresses()
+        mac = mac_list_obj.get_mac_address()[0]
+        print 'Port is on compute node %s, MAC %s' %(compute, mac)
+
+        print '# Get link info...'
+        link_info = self.get_link_info(compute, mac)
+        print 'PF device is %s.' %link_info['local-port']
+
+        #dev_name, dev_port = self.get_device_info(args.api_server,
+        #        compute, pf_name)
+        #if not dev_name:
+        #    print 'ERROR: Not found device for %s!' %compute
+        #    return
+
+        dev_name = link_info['remote-device'].split('.')[0]
+        dev_port = link_info['remote-port']
+        dev_obj = self.vnc.physical_router_read(
+            fq_name = ['default-global-system-config', dev_name])
+        fabric_fqn = dev_obj.get_fabric_refs()[0]['to']
+        print 'fabric name: %s' %fabric_fqn[1]
+        print 'device name: %s' %dev_name
+        print 'device port: %s' %dev_port
+
+        vpg_name = dev_name + '_' + dev_port
+        try:
+            vpg_obj = self.vnc.virtual_port_group_read(
+                    fq_name = fabric_fqn + [vpg_name])
+            print 'VGP %s is found.' %vpg_name
+        except Exception as e:
+            print 'Create VGP %s...' %vpg_name
+            fabric_obj = self.vnc.fabric_read(fq_name = fabric_fqn)
+            vpg_obj = vnc_api.VirtualPortGroup(parent_obj = fabric_obj,
+                    name = vpg_name)
+            self.vnc.virtual_port_group_create(vpg_obj)
+            print 'VGP %s is created.' %vpg_name
+
+        vn_obj = self.vnc.virtual_network_read(
+                fq_name = self.tenant.fq_name + [args.network])
+        id = str(uuid.uuid4())
+        vmi = vnc_api.VirtualMachineInterface(name = id,
+                parent_obj = self.tenant)
+        vmi.uuid = id
+        vmi.set_virtual_network(vn_obj)
+        vm_obj = self.vnc.virtual_machine_read(id = vm_id)
+        vmi.set_virtual_machine(vm_obj)
+        profile_dict = {'local_link_information':
+                    [
+                        {
+                            'port_id': dev_port,
+                            'switch_id': dev_port,
+                            'switch_info': dev_name,
+                            'fabric': fabric_fqn[1]
+                        }
+                    ]
+                }
+        kvp_list= [
+                {
+                    'key': 'vnic_type',
+                    'value': 'baremetal'
+                },
+                {
+                    'key': 'vif_type',
+                    'value': 'vrouter'
+                },
+                {
+                    'key': 'vpg',
+                    'value': vpg_name
+                },
+                {
+                    'key': 'profile',
+                    'value': json.dumps(profile_dict)
+                },
+            ]
+        if args.trunk:
+            vlan_id = 0
+            port_vlan = {'key': 'tor_port_vlan_id',
+                    'value': '1'}
+            kvp_list.append(port_vlan)
+        else:
+            vlan_id = vn_obj.get_virtual_network_network_id()
+        kvps = vnc_api.KeyValuePairs()
+        for kvp in kvp_list:
+            kvps.add_key_value_pair(vnc_api.KeyValuePair(key = kvp['key'],
+                    value = kvp['value']))
+        vmi.set_virtual_machine_interface_bindings(kvps)
+        prop = vnc_api.VirtualMachineInterfacePropertiesType(
+                sub_interface_vlan_tag = vlan_id)
+        vmi.set_virtual_machine_interface_properties(prop)
+        try:
+            self.vnc.virtual_machine_interface_create(vmi)
+        except Exception as e:
+            print 'ERROR: %s' %(str(e))
+            return
+        print 'VM port %s is created.' %id
+
+    def cmd_launch_vm(self, args):
+        print '\n# Launch SRIOV VM...'
+        if not args.network:
+            print 'ERROR: Argument "network" is missing!'
+            return
+        vn_obj = self.update_network(args)
+        if not vn_obj:
+            return
+        port_id = self.create_vm_port_contrail(args)
+        if not port_id:
+            return
+        vm_id = self.launch_vm(args, port_id)
+        if not vm_id:
+            return
+        self.create_device_port(args, vm_id, port_id)
+
+    def cmd_delete_vm(self, args):
+        print '\n# Delete VM %s...' %args.name
+        os_args = 'server show %s -c id -f value' %args.name
+        vm_id = self.openstack_cli(os_args).rstrip()
+        vmi_ref_list = None
+        try:
+            vm = self.vnc.virtual_machine_read(id = vm_id)
+            vmi_ref_list = vm.get_virtual_machine_interface_back_refs()
+        except:
+            print 'VM %s is not found in Contrail.' %args.name
+        os_args = 'server delete %s' %args.name
+        self.openstack_cli(os_args).rstrip()
+        print 'VM %s is deleted.' %args.name
+        if not vmi_ref_list:
+            return
+        for vmi_ref in vmi_ref_list:
+            print '# Delete port %s...' %vmi_ref['uuid']
+            vmi = self.vnc.virtual_machine_interface_read(id = vmi_ref['uuid'])
+            iip_ref_list = vmi.get_instance_ip_back_refs()
+            if iip_ref_list:
+                for iip_ref in iip_ref_list:
+                    self.vnc.instance_ip_delete(id = iip_ref['uuid'])
+            self.vnc.virtual_machine_interface_delete(id = vmi_ref['uuid'])
+            print 'Port %s is deleted.' %vmi_ref['uuid']
+
+    def parser_init(self):
+        parser = argparse.ArgumentParser()
+        self.parser = parser
+        parser.add_argument('--auth-username', help = 'User name')
+        parser.add_argument('--auth-password', help = 'Password')
+        parser.add_argument('--auth-tenant', help = 'Auth tenant name')
+        parser.add_argument('--auth-domain', help = 'Auth domain name')
+        parser.add_argument('--auth-region', help = 'Region name')
+        parser.add_argument('--auth-server', help = 'Auth server address')
+        parser.add_argument('--auth-url', help = 'Auth URL')
+        parser.add_argument('--api-server', help = 'API server address')
+        parser.add_argument('--domain', help = 'Domain name')
+        parser.add_argument('--tenant', help = 'Tenant name')
+
+        parser.add_argument('cmd', help = 'Command')
+        parser.add_argument('name', help = 'Name')
+        parser.add_argument('--network', help = 'Virtual network')
+        parser.add_argument('--az', help = 'Availability zone')
+        parser.add_argument('--trunk', action = 'store_true',
+                help = 'Trunk VF')
+
+    def start(self):
+        self.parser_init()
+        args = self.parser.parse_args()
+        #print 'args: %s' %args
+        #return
+        connect = ConfigConnect(args)
+        if not connect.vnc:
+            return
+        self.vnc = connect.vnc
+        self.tenant = connect.tenant
+        cmd_map = {'launch-vm': self.cmd_launch_vm,
+                   'delete-vm': self.cmd_delete_vm}
+        func = cmd_map.get(args.cmd)
+        if func:
+            func(args)
+        else:
+            print 'ERROR: Command %s is invalid!' %args.cmd
+
+
+if __name__ == '__main__':
+    for arg in default_args:
+        if not ('--' + arg[0]) in sys.argv:
+            env_v = os.environ.get(arg[0].upper().replace('-', '_'))
+            if env_v:
+                arg_v = env_v
+            else:
+                arg_v = arg[1]
+            sys.argv.insert(1, ('--' + arg[0]))
+            sys.argv.insert(2, arg_v)
+    SriovCli().start()
+
