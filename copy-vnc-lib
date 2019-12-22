@@ -1,4 +1,0 @@
-#!/bin/bash
-docker cp config_api_1:/usr/lib/python2.7/site-packages/vnc_api ./
-docker cp config_api_1:/usr/lib/python2.7/site-packages/cfgm_common ./
-
