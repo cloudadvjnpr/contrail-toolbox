@@ -370,6 +370,9 @@ class ConfigOp():
             time.sleep(2)
             response = requests.get(url)
             body = response.json()
+            if not body:
+                print 'Waiting for UVE %s...' %template_fqn
+                continue
             status = body['FabricJobExecution']['job_status']
             progress = body['FabricJobExecution']['percentage_completed']
             if (type(status) is unicode):
