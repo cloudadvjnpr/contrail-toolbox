@@ -390,14 +390,14 @@ class ConfigOp():
         self.check_job(res)
 
     def update_ref(self, res):
-        src_id = self.vnc.fq_name_to_id(res['resource']['src_type'],
-                res['resource']['src_fqn'])
-        dst_id = self.vnc.fq_name_to_id(res['resource']['dst_type'],
-                res['resource']['dst_fqn'])
-        self.vnc.ref_update(operation = res['operation'],
+        src = res['resource']
+        src_id = self.vnc.fq_name_to_id(src['src_type'], src['src_fqn'])
+        for dst in res['resource']['dst']:
+            dst_id = self.vnc.fq_name_to_id(dst['dst_type'], dst['dst_fqn'])
+            self.vnc.ref_update(operation = res['operation'],
                 obj_type = res['resource']['src_type'], obj_uuid = src_id,
-                ref_type = res['resource']['dst_type'], ref_uuid = dst_id,
-                attr = res['resource']['attr'], ref_fq_name = None)
+                ref_type = dst['dst_type'], ref_uuid = dst_id,
+                attr = dst['attr'], ref_fq_name = None)
 
     def fqn_to_id(self, res, args):
         print self.vnc.fq_name_to_id(args.res_type, str_to_fqn(args.fqn))
