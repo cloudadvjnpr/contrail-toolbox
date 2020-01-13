@@ -124,9 +124,12 @@ class ConfigResource():
         if (args.format == 'yaml'):
             dict = [{
                 'resource_type': res._type,
-                'parent_type': res.parent_type,
                 'resource_fq_name': res.fq_name,
                 'resource': self.obj_to_dict(res)}]
+            if hasattr(res, 'parent_type'):
+                dict[0]['parent_type'] = res.parent_type
+            else:
+                dict[0]['parent_type'] = 'config-root'
             print yaml.safe_dump(dict, default_flow_style=False)
         elif (args.format == 'dump'):
             res.dump()
@@ -230,7 +233,10 @@ class ConfigResource():
             obj = func(fq_name = res_fqn)
             update = True
         except:
-            obj = cls(parent_type = parent_type, fq_name = res_fqn)
+            if parent_type == 'config-root':
+                obj = cls(fq_name = res_fqn)
+            else:
+                obj = cls(parent_type = parent_type, fq_name = res_fqn)
             update = False
         for name in res.keys():
             if name in cls.prop_fields:
