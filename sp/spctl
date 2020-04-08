@@ -1,0 +1,394 @@
+#!/bin/bash
+
+api_url=https://gateway.stackpath.com
+client_id=29a6e90612ba5d78438c3066d30f0821
+client_secret=0d7b1bb61361eac73eee73f2b02abc0f541ecafc801566bc4b5c1bd416ff7794
+stack_id=poc-a62824
+
+
+get_token()
+{
+    cat << __EOF__ > /tmp/body
+{
+    "client_id": "$client_id",
+    "client_secret": "$client_secret",
+    "grant_type": "client_credentials"
+}
+__EOF__
+
+    token=$(curl -s -X POST -H "content-type: application/json" \
+        -d @/tmp/body \
+        $api_url/identity/v1/oauth2/token | jq -r .access_token)
+
+    #echo $token
+}
+
+list_location()
+{
+    curl -s -X GET -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/workload/v1/locations | \
+        python -c "
+import json
+import sys
+print '{0:20} {1}'.format('City', 'Code')
+print '------------------------------'
+for i in json.load(sys.stdin)['results']:
+    #print i
+    print '{0:20} {1}'.format(i['city'], i['cityCode'])"
+
+}
+
+list_workload()
+{
+    curl -s -X GET -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/workload/v1/stacks/$stack_id/workloads | \
+        jq '.results[] | {name, id}'
+}
+
+list_policy()
+{
+    curl -s -X GET -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/ipam/v1/stacks/$stack_id/network_policies | \
+        jq '.results[] | {name, id}'
+}
+
+show_workload()
+{
+    local id=$1
+
+    curl -s -X GET -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/workload/v1/stacks/$stack_id/workloads/$id | \
+        jq .
+}
+
+show_policy()
+{
+    local id=$1
+
+    curl -s -X GET -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/ipam/v1/stacks/$stack_id/network_policies/$id | \
+        jq .
+}
+
+delete_workload()
+{
+    local id=$1
+
+    curl -s -X DELETE -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/workload/v1/stacks/$stack_id/workloads/$id | \
+        jq .
+}
+
+delete_policy()
+{
+    local id=$1
+
+    curl -s -X DELETE -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        $api_url/ipam/v1/stacks/$stack_id/network_policies/$id | \
+        jq .
+}
+
+create_policy()
+{
+    local id=$1
+
+    cat << __EOF__ > /tmp/body
+{
+  "networkPolicy": {
+    "name": "Web policy",
+    "spec": {
+      "instanceSelectors": [
+        {
+          "key": "workload.platform.stackpath.net/workload-id",
+          "operator": "in",
+          "values": [
+            "$id"
+          ]
+        }
+      ],
+      "networkSelectors": [],
+      "policyTypes": [
+        "INGRESS",
+        "EGRESS"
+      ],
+      "priority": 65534,
+      "ingress": [
+        {
+          "description": "any",
+          "action": "ALLOW",
+          "from": {
+            "ipBlock": [
+              {
+                "cidr": "0.0.0.0/0",
+                "except": []
+              }
+            ],
+            "instanceSelectors": [],
+            "networkSelectors": []
+          },
+          "protocols": {
+            "tcp": {
+              "destinationPorts": [
+                "1-10000"
+              ],
+              "sourcePorts": []
+            }
+          }
+        }
+      ],
+      "egress": [
+        {
+          "description": "any",
+          "action": "ALLOW",
+          "to": {
+            "ipBlock": [
+              {
+                "cidr": "0.0.0.0/0",
+                "except": []
+              }
+            ],
+            "instanceSelectors": [],
+            "networkSelectors": []
+          },
+          "protocols": {
+            "tcp": {
+              "destinationPorts": [
+                "1-10000"
+              ],
+              "sourcePorts": []
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+__EOF__
+
+    rc=$(curl -s -X POST -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        -d @/tmp/body \
+        $api_url/ipam/v1/stacks/$stack_id/network_policies)
+
+    echo $rc
+}
+
+launch_container()
+{
+    cat << __EOF__ > /tmp/body
+{
+   "workload": {
+      "name": "web-c",
+      "metadata": {
+        "version": "1",
+        "annotations": {
+          "anycast.platform.stackpath.net": "true"
+        }
+      },
+      "spec": {
+        "networkInterfaces": [
+          {
+            "network": "default"
+          }
+        ],
+        "containers": {
+          "webserver": {
+            "image": "nginx:latest",
+            "command": [],
+            "ports": {
+              "http": {
+                "port": 80
+              },
+              "https": {
+                "port": 443
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "1",
+                "memory": "2Gi"
+              }
+            }
+          }
+        }
+      },
+      "targets": {
+        "north-america": {
+          "spec": {
+            "deploymentScope": "cityCode",
+            "deployments": {
+              "minReplicas": 1,
+              "selectors": [
+                {
+                  "key": "cityCode",
+                  "operator": "in",
+                  "values": [
+                    "SEA","SJC"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+}
+__EOF__
+
+    rc=$(curl -s -X POST -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        -d @/tmp/body \
+        $api_url/workload/v1/stacks/$stack_id/workloads)
+
+    echo $rc
+}
+
+launch_vm()
+{
+    cat << __EOF__ > /tmp/body
+{
+   "workload": {
+      "name": "web-v",
+      "metadata": {
+        "annotations": {
+          "anycast.platform.stackpath.net": "true"
+        }
+      },
+      "spec": {
+        "networkInterfaces": [
+          {
+            "network": "default"
+          }
+        ],
+        "virtualMachines": {
+          "webserver": {
+            "image": "stackpath-edge/centos-7:v201910030139",
+            "userData": "I2Nsb3VkLWNvbmZpZwoKdXNlcnM6CiAgLSBuYW1lOiBqdW5pcGVyCiAgICBzdWRvOiBBTEw9KEFMTCkgTk9QQVNTV0Q6QUxMCiAgICBncm91cHM6IHVzZXJzLCBhZG1pbgogICAgc3NoX2ltcG9ydF9pZDogTm9uZQogICAgbG9ja19wYXNzd2Q6IHRydWUKICAgIHNzaF9hdXRob3JpemVkX2tleXM6CiAgICAgIC0gc3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFEbHBqRWRtUWFLWkJjN2Q2eVl6UXJNeHd2T2NVNHJVeTA3UzgvTXM0Z3E5djE3UU5qUS8rQjlERXpQeTd6dUpTRDdnMEozc1A5dTkxdE1EeExQYTA2SWEybnRlVG13OHlJbmNtSDRnYkxvdWdZOWp1MWEyYVd5OWlaZWV6NXFGUDMyS253KzhOVzRBZW1Hb2k2eW1BcXdYeXVaOGJuUCt0TzNiSWN1MXljcnEvSFBBZ282L3Y3RUwvRG5qWWxzc3hqdDN1WjZDWmlvRFg5K2hROWpBcHJZMkIvYjZrVlB2T0VjL3hwVjNHWWlhSy9HajRXOTNkWjlhNno5TTVtNnhld3dVVVVjejZFeUowa2tGOEJlaW96YmtZL3g4RTMzdU5YYTk5d3JvcVFabnlPemYwaSs0V1kwMklscmN5WDBOR3p3OUl6Y0hmaGVnYTdUWHQ1VGtZS1YgY29udHJhaWwtcG9jCgpwYWNrYWdlczoKICAtIGh0dHBkCgpydW5jbWQ6CiAgLSBzeXN0ZW1jdGwgc3RhcnQgaHR0cGQKICAtIGVjaG8gIjxodG1sPjxib2R5PiIgPiAvdmFyL3d3dy9odG1sL2luZGV4Lmh0bWwKICAtIGVjaG8gIjxoMT5XZWxjb21lIHRvICQoaG9zdG5hbWUpPC9oMT4iID4+IC92YXIvd3d3L2h0bWwvaW5kZXguaHRtbAogIC0gZWNobyAiPC9ib2R5PjwvaHRtbD4iID4+IC92YXIvd3d3L2h0bWwvaW5kZXguaHRtbAoK",
+            "ports": {
+              "http": {
+                "port": 80
+              },
+              "https": {
+                "port": 443
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "1",
+                "memory": "2Gi"
+              }
+            }
+          }
+        }
+      },
+      "targets": {
+        "north-america": {
+          "spec": {
+            "deploymentScope": "cityCode",
+            "deployments": {
+              "minReplicas": 1,
+              "selectors": [
+                {
+                  "key": "cityCode",
+                  "operator": "in",
+                  "values": [
+                    "SEA","SJC"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+}
+__EOF__
+
+    rc=$(curl -s -X POST -H "accept: application/json" \
+        -H "authorization: bearer $token" \
+        -d @/tmp/body \
+        $api_url/workload/v1/stacks/$stack_id/workloads)
+
+    echo $rc
+}
+
+test()
+{
+    echo "Test"
+}
+
+help()
+{
+    echo "Help"
+}
+
+main()
+{
+    case "$1" in
+        test)
+            test
+            ;;
+        get-token)
+            get_token
+            ;;
+        list-location)
+            get_token
+            list_location
+            ;;
+        launch-container)
+            get_token
+            launch_container
+            ;;
+        launch-vm)
+            get_token
+            launch_vm
+            ;;
+        list-workload)
+            get_token
+            list_workload
+            ;;
+        list-policy)
+            get_token
+            list_policy
+            ;;
+        show-workload)
+            shift
+            get_token
+            show_workload "$@"
+            ;;
+        show-policy)
+            shift
+            get_token
+            show_policy "$@"
+            ;;
+        create-policy)
+            shift
+            get_token
+            create_policy "$@"
+            ;;
+        delete-workload)
+            shift
+            get_token
+            delete_workload "$@"
+            ;;
+        delete-policy)
+            shift
+            get_token
+            delete_policy "$@"
+            ;;
+        *)
+            help
+            ;;
+    esac
+}
+
+main "$@"
+exit 0
+
