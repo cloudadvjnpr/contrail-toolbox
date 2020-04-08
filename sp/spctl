@@ -1,8 +1,8 @@
 #!/bin/bash
 
+source secret.var
+
 api_url=https://gateway.stackpath.com
-client_id=__client_id__
-client_secret=__client_secret__
 stack_id=poc-a62824
 
 
@@ -35,7 +35,7 @@ print '{0:20} {1}'.format('City', 'Code')
 print '------------------------------'
 for i in json.load(sys.stdin)['results']:
     #print i
-    print '{0:20} {1}'.format(i['city'], i['cityCode'])"
+    print '{0:20} {1}'.format(repr(i['city']), i['cityCode'])"
 
 }
 
