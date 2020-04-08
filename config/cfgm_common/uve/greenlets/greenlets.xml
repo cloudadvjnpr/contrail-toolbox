@@ -1,5 +1,0 @@
-<?xml-stylesheet type="text/xsl" href="/universal_parse.xsl"?>
-<greenlets type="rlist">
-<GreenletObjectReq type="sandesh">
-<greenlet_name type="string">0</greenlet_name></GreenletObjectReq>
-</greenlets>
